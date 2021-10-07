@@ -3,11 +3,13 @@
 from __future__ import print_function
 import traceback
 import threading
+import math
 
 import rospy
 import diagnostic_updater
 import diagnostic_msgs
 
+from geometry_msgs.msg import Twist
 from roboclaw_driver.msg import Stats, SpeedCommand
 from roboclaw_driver import RoboclawControl, Roboclaw, RoboclawStub
 
@@ -32,7 +34,7 @@ class RoboclawNode:
         """
         self._node_name = node_name
         self._rbc_ctls = []  # Populated by the connect() method
-
+        self.params = rospy.get_param("odom_node")
         # Records the values of the last speed command
         self._last_cmd_time = rospy.get_rostime()
         self._last_cmd_m1_qpps = 0
@@ -56,8 +58,8 @@ class RoboclawNode:
         # Set up the SpeedCommand Subscriber
         rospy.Subscriber(
             rospy.get_param("~speed_cmd_topic", DEFAULT_SPEED_CMD_TOPIC),
-            SpeedCommand,
-            self._speed_cmd_callback
+            Twist, #SpeedCommand
+            self._cmd_vel_callback #_speed_cmd_callback
         )
 
         # For logdebug
@@ -205,6 +207,32 @@ class RoboclawNode:
 
                     if not success:
                         rospy.logerr("RoboclawControl SpeedAccelDistanceM1M2 failed")
+
+
+    def _cmd_vel_callback(self, twist):
+        with self._speed_cmd_lock:
+            self._last_cmd_time = rospy.get_rostime()
+
+            
+            self.BASE_WIDTH = self.params["wheel_base"]
+            self.TICKS_PER_METER = self.params["pulse_per_rev"]/(2*math.pi*self.params["wheel_radius"])
+            
+            linear_x = -1.0* twist.linear.x
+            vr = linear_x + twist.angular.z * self.BASE_WIDTH / 2.0  # m/s
+            vl = linear_x - twist.angular.z * self.BASE_WIDTH / 2.0
+
+            vr_ticks = int(vr * self.TICKS_PER_METER)  # ticks/s
+            vl_ticks = int(vl * self.TICKS_PER_METER)
+            rospy.logdebug("vr_ticks:%d vl_ticks: %d", vr_ticks, vl_ticks)
+
+            for rbc_ctl in self._rbc_ctls:
+                success = rbc_ctl.driveM1M2qpps(
+                    vl_ticks, vr_ticks,
+                    0, 1
+                )
+
+                if not success:
+                    rospy.logerr("RoboclawControl SpeedAccelDistanceM1M2 failed")
 
     def shutdown_node(self):
         """Performs Node shutdown tasks
