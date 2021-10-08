@@ -4,17 +4,20 @@ from __future__ import print_function
 import traceback
 import threading
 import math
+from math import pi, cos, sin
 
 import rospy
 import diagnostic_updater
 import diagnostic_msgs
+import tf
 
-from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist, Quaternion
 from roboclaw_driver.msg import Stats, SpeedCommand
 from roboclaw_driver import RoboclawControl, Roboclaw, RoboclawStub
 
 
-DEFAULT_DEV_NAMES = "/dev/ttyACM0"
+DEFAULT_DEV_NAMES = "/dev/roboclaw1,/dev/roboclaw2"
 DEFAULT_BAUD_RATE = 115200
 DEFAULT_NODE_NAME = "roboclaw"
 DEFAULT_LOOP_HZ = 100
@@ -23,6 +26,106 @@ DEFAULT_DEADMAN_SEC = 3
 DEFAULT_STATS_TOPIC = "~stats"
 DEFAULT_SPEED_CMD_TOPIC = "~speed_command"
 
+class EncoderOdom:
+    def __init__(self, ticks_per_meter, base_width):
+        self.TICKS_PER_METER = ticks_per_meter
+        self.BASE_WIDTH = base_width
+        self.odom_pub = rospy.Publisher('/odom', Odometry, queue_size=10)
+        self.cur_x = 0
+        self.cur_y = 0
+        self.cur_theta = 0.0
+        self.last_enc_left = 0
+        self.last_enc_right = 0
+        self.last_enc_time = rospy.Time.now()
+
+    @staticmethod
+    def normalize_angle(angle):
+        while angle > pi:
+            angle -= 2.0 * pi
+        while angle < -pi:
+            angle += 2.0 * pi
+        return angle
+
+    def update(self, enc_left, enc_right):
+        left_ticks = enc_left - self.last_enc_left
+        right_ticks = enc_right - self.last_enc_right
+        self.last_enc_left = enc_left
+        self.last_enc_right = enc_right
+
+        dist_left = left_ticks / self.TICKS_PER_METER
+        dist_right = right_ticks / self.TICKS_PER_METER
+        dist = (dist_right + dist_left) / 2.0
+
+        current_time = rospy.Time.now()
+        d_time = (current_time - self.last_enc_time).to_sec()
+        self.last_enc_time = current_time
+
+        # TODO find better what to determine going straight, this means slight deviation is accounted
+        if left_ticks == right_ticks:
+            d_theta = 0.0
+            self.cur_x += dist * cos(self.cur_theta)
+            self.cur_y += dist * sin(self.cur_theta)
+        else:
+            d_theta = (dist_right - dist_left) / self.BASE_WIDTH
+            r = dist / d_theta
+            self.cur_x += r * (sin(d_theta + self.cur_theta) - sin(self.cur_theta))
+            self.cur_y -= r * (cos(d_theta + self.cur_theta) - cos(self.cur_theta))
+            self.cur_theta = self.normalize_angle(self.cur_theta + d_theta)
+
+        if abs(d_time) < 0.000001:
+            vel_x = 0.0
+            vel_theta = 0.0
+        else:
+            vel_x = dist / d_time
+            vel_theta = d_theta / d_time
+
+        return vel_x, vel_theta
+
+    def update_publish(self, enc_left, enc_right):
+        # 2106 per 0.1 seconds is max speed, error in the 16th bit is 32768
+        # TODO lets find a better way to deal with this error
+        if abs(enc_left - self.last_enc_left) > 20000:
+            rospy.logerr("Ignoring left encoder jump: cur %d, last %d" % (enc_left, self.last_enc_left))
+        elif abs(enc_right - self.last_enc_right) > 20000:
+            rospy.logerr("Ignoring right encoder jump: cur %d, last %d" % (enc_right, self.last_enc_right))
+        else:
+            vel_x, vel_theta = self.update(enc_left, enc_right)
+            self.publish_odom(self.cur_x, self.cur_y, self.cur_theta, vel_x, vel_theta)
+
+    def publish_odom(self, cur_x, cur_y, cur_theta, vx, vth):
+        quat = tf.transformations.quaternion_from_euler(0, 0, cur_theta)
+        current_time = rospy.Time.now()
+
+        br = tf.TransformBroadcaster()
+        br.sendTransform((cur_x, cur_y, 0),
+                         tf.transformations.quaternion_from_euler(0, 0, -cur_theta),
+                         current_time,
+                         "base_link",
+                         "odom")
+
+        odom = Odometry()
+        odom.header.stamp = current_time
+        odom.header.frame_id = 'odom'
+
+        odom.pose.pose.position.x = cur_x
+        odom.pose.pose.position.y = cur_y
+        odom.pose.pose.position.z = 0.0
+        odom.pose.pose.orientation = Quaternion(*quat)
+
+        odom.pose.covariance[0] = 0.01
+        odom.pose.covariance[7] = 0.01
+        odom.pose.covariance[14] = 99999
+        odom.pose.covariance[21] = 99999
+        odom.pose.covariance[28] = 99999
+        odom.pose.covariance[35] = 0.01
+
+        odom.child_frame_id = 'base_link'
+        odom.twist.twist.linear.x = vx
+        odom.twist.twist.linear.y = 0
+        odom.twist.twist.angular.z = vth
+        odom.twist.covariance = odom.pose.covariance
+
+        self.odom_pub.publish(odom)
 
 class RoboclawNode:
     def __init__(self, node_name):
@@ -35,6 +138,9 @@ class RoboclawNode:
         self._node_name = node_name
         self._rbc_ctls = []  # Populated by the connect() method
         self.params = rospy.get_param("odom_node")
+        self.BASE_WIDTH = self.params["wheel_base"]
+        self.TICKS_PER_METER = self.params["pulse_per_rev"]/(2*math.pi*self.params["wheel_radius"])
+        self.enc_node = EncoderOdom(self.TICKS_PER_METER, self.BASE_WIDTH)
         # Records the values of the last speed command
         self._last_cmd_time = rospy.get_rostime()
         self._last_cmd_m1_qpps = 0
@@ -105,7 +211,8 @@ class RoboclawNode:
                 for error in stats.error_messages:
                     rospy.logwarn(error)
                 if read_success:
-                    self._publish_stats(stats)
+                    # self._publish_stats(stats)
+                    self.enc_node.update_publish(stats.m2_enc_val, stats.m1_enc_val)
                 else:
                     rospy.logwarn("Error reading stats from Roboclaw: {}".format(stats))
 
@@ -213,10 +320,6 @@ class RoboclawNode:
         with self._speed_cmd_lock:
             self._last_cmd_time = rospy.get_rostime()
 
-            
-            self.BASE_WIDTH = self.params["wheel_base"]
-            self.TICKS_PER_METER = self.params["pulse_per_rev"]/(2*math.pi*self.params["wheel_radius"])
-            
             linear_x = -1.0* twist.linear.x
             vr = linear_x + twist.angular.z * self.BASE_WIDTH / 2.0  # m/s
             vl = linear_x - twist.angular.z * self.BASE_WIDTH / 2.0
@@ -255,13 +358,14 @@ if __name__ == "__main__":
     deadman_secs = int(rospy.get_param("~deadman_secs", DEFAULT_DEADMAN_SEC))
     test_mode = bool(rospy.get_param("~test_mode", False))
 
-    rospy.logdebug("node_name: {}".format(node_name))
-    rospy.logdebug("dev_names: {}".format(dev_names))
-    rospy.logdebug("baud: {}".format(baud_rate))
-    rospy.logdebug("address: {}".format(address))
-    rospy.logdebug("loop_hz: {}".format(loop_hz))
-    rospy.logdebug("deadman_secs: {}".format(deadman_secs))
-    rospy.logdebug("test_mode: {}".format(test_mode))
+    rospy.loginfo("node_name: {}".format(node_name))
+    rospy.loginfo("dev_names: {}".format(dev_names))
+    rospy.loginfo("baud: {}".format(baud_rate))
+    rospy.loginfo("address: {}".format(address))
+    rospy.loginfo("loop_hz: {}".format(loop_hz))
+    rospy.loginfo("deadman_secs: {}".format(deadman_secs))
+    rospy.loginfo("test_mode: {}".format(test_mode))
+    print("dev_names: {}".format(dev_names))
 
     node = RoboclawNode(node_name)
     rospy.on_shutdown(node.shutdown_node)

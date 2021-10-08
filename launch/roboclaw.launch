@@ -3,11 +3,11 @@
     This is the production launch file to be used with the real roboclaw device.
 -->
  <launch>
-
+    <rosparam command="load" file="$(find roboclaw_driver)/config/config.yml" />
     <arg name="name"            default="roboclaw"                  />
     <arg name="test_mode"       default="false"                     />
-    <arg name="dev_names"       default="/dev/ttyACM0"              />
-    <arg name="baud"            default="115200"                    />
+    <arg name="dev_names"       default="/dev/roboclaw0,/dev/roboclaw1"              />
+    <arg name="baud"            default="38400"                    />
     <arg name="address"         default="128"                       />
     <arg name="loop_hz"         default="10"                        />
     <arg name="deadman_secs"    default="3"                         />
@@ -25,5 +25,4 @@
         <param name="speed_cmd_topic" type="str" value="$(arg speed_cmd_topic)" />
         <param name="stats_topic" type="str" value="$(arg stats_topic)" />
     </node>
-
 </launch>
